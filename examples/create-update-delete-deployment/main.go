@@ -18,22 +18,21 @@ limitations under the License.
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	appsv1beta1 "k8s.io/api/apps/v1beta1"
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/client-go/util/retry"
-	// Uncomment the following line to load the gcp plugin (only required to authenticate against GKE clusters).
-	// _ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 )
+
+const deploymentName = "demo-deployment"
 
 func main() {
 	var kubeconfig *string
@@ -53,11 +52,27 @@ func main() {
 		panic(err)
 	}
 
-	deploymentsClient := clientset.AppsV1beta1().Deployments(apiv1.NamespaceDefault)
+	v1beta1DeploymentsClient := clientset.AppsV1beta1().Deployments(apiv1.NamespaceDefault)
+
+	pp := metav1.DeletePropagationBackground
+	err = v1beta1DeploymentsClient.Delete(deploymentName, &metav1.DeleteOptions{
+		GracePeriodSeconds: int64Ptr(0),
+		PropagationPolicy:  &pp,
+	})
+
+	switch {
+	case err == nil:
+		fmt.Println("Deleted deployment.")
+	case err != nil:
+		if !errors.IsNotFound(err) {
+			panic(fmt.Sprintf("Failed to delete deployment: %s", err))
+		}
+		fmt.Println("Deployment does not exist.")
+	}
 
 	deployment := &appsv1beta1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "demo-deployment",
+			Name: deploymentName,
 		},
 		Spec: appsv1beta1.DeploymentSpec{
 			Replicas: int32Ptr(2),
@@ -88,100 +103,39 @@ func main() {
 
 	// Create Deployment
 	fmt.Println("Creating deployment...")
-	result, err := deploymentsClient.Create(deployment)
+	resultV1, err := v1beta1DeploymentsClient.Create(deployment)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Created deployment %q.\n", result.GetObjectMeta().GetName())
+	fmt.Printf("Created deployment %q in version %q.\n", resultV1.GetObjectMeta().GetName(), resultV1.TypeMeta.APIVersion)
 
 	// Update Deployment
-	prompt()
 	fmt.Println("Updating deployment...")
-	//    You have two options to Update() this Deployment:
-	//
-	//    1. Modify the "deployment" variable and call: Update(deployment).
-	//       This works like the "kubectl replace" command and it overwrites/loses changes
-	//       made by other clients between you Create() and Update() the object.
-	//    2. Modify the "result" returned by Get() and retry Update(result) until
-	//       you no longer get a conflict error. This way, you can preserve changes made
-	//       by other clients between Create() and Update(). This is implemented below
-	//			 using the retry utility package included with client-go. (RECOMMENDED)
-	//
-	// More Info:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/api-conventions.md#concurrency-control-and-consistency
+
+	v1beta2DeploymentsClient := clientset.AppsV1beta2().Deployments(apiv1.NamespaceDefault)
+
+	// Retrieve the latest version of Deployment before attempting update
+	resultV2, getErr := v1beta2DeploymentsClient.Get(deploymentName, metav1.GetOptions{})
+	if getErr != nil {
+		panic(fmt.Errorf("Failed to get latest version of Deployment: %v", getErr))
+	}
 
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		// Retrieve the latest version of Deployment before attempting update
-		// RetryOnConflict uses exponential backoff to avoid exhausting the apiserver
-		result, getErr := deploymentsClient.Get("demo-deployment", metav1.GetOptions{})
+		result, getErr := v1beta2DeploymentsClient.Get(deploymentName, metav1.GetOptions{})
 		if getErr != nil {
 			panic(fmt.Errorf("Failed to get latest version of Deployment: %v", getErr))
 		}
 
-		result.Spec.Replicas = int32Ptr(1)                           // reduce replica count
-		result.Spec.Template.Spec.Containers[0].Image = "nginx:1.13" // change nginx version
-		_, updateErr := deploymentsClient.Update(result)
+		var updateErr error
+		resultV2, updateErr = v1beta2DeploymentsClient.Update(result)
 		return updateErr
 	})
 	if retryErr != nil {
 		panic(fmt.Errorf("Update failed: %v", retryErr))
 	}
-	fmt.Println("Updated deployment...")
 
-	// Rollback Deployment
-	prompt()
-	fmt.Println("Rolling back deployment...")
-	// Once again use RetryOnConflict to avoid update conflicts
-	retryErr = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		result, getErr := deploymentsClient.Get("demo-deployment", metav1.GetOptions{})
-		if getErr != nil {
-			panic(fmt.Errorf("Failed to get latest version of Deployment: %v", getErr))
-		}
-
-		result.Spec.RollbackTo = &appsv1beta1.RollbackConfig{
-			Revision: 0, // can be specific revision number, or 0 for last revision
-		}
-		_, updateErr := deploymentsClient.Update(result)
-		return updateErr
-	})
-	if retryErr != nil {
-		panic(fmt.Errorf("Rollback failed: %v", retryErr))
-	}
-	fmt.Println("Rolled back deployment...")
-
-	// List Deployments
-	prompt()
-	fmt.Printf("Listing deployments in namespace %q:\n", apiv1.NamespaceDefault)
-	list, err := deploymentsClient.List(metav1.ListOptions{})
-	if err != nil {
-		panic(err)
-	}
-	for _, d := range list.Items {
-		fmt.Printf(" * %s (%d replicas)\n", d.Name, *d.Spec.Replicas)
-	}
-
-	// Delete Deployment
-	prompt()
-	fmt.Println("Deleting deployment...")
-	deletePolicy := metav1.DeletePropagationForeground
-	if err := deploymentsClient.Delete("demo-deployment", &metav1.DeleteOptions{
-		PropagationPolicy: &deletePolicy,
-	}); err != nil {
-		panic(err)
-	}
-	fmt.Println("Deleted deployment.")
-}
-
-func prompt() {
-	fmt.Printf("-> Press Return key to continue.")
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		break
-	}
-	if err := scanner.Err(); err != nil {
-		panic(err)
-	}
-	fmt.Println()
+	fmt.Printf("Updated deployment %q in version %q.\n", resultV2.GetObjectMeta().GetName(), resultV2.TypeMeta.APIVersion)
 }
 
 func int32Ptr(i int32) *int32 { return &i }
+func int64Ptr(i int64) *int64 { return &i }
